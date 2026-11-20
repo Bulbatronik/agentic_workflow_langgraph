@@ -2,13 +2,16 @@ import os
 import uuid
 import time
 import subprocess
+import warnings
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Literal
 from pydantic import BaseModel, Field
 from ddgs import DDGS # For the web search
 
 from langchain.chat_models import init_chat_model
-from langchain_core.vectorstores import InMemoryVectorStore
+warnings.filterwarnings('ignore', message='.*langchain-community', category=DeprecationWarning)
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langgraph.graph import MessagesState, StateGraph, START, END
@@ -21,21 +24,22 @@ load_dotenv()
 
 llm = init_chat_model('openai:gpt-4.1-mini')
 
-KNOWLEDGE = [
-    'Zentrix Labs was founded in 2019 in Tallinn by Mira Okonkwo and Jonas Feld.',
-    'Zentrix Labs has 42 employees and its office is on the 7th floor of the Lumen Tower.',
-    'The company mascot is a purple otter named Byte.',
-    'The flagship product is FlowPilot, a tool that turns spreadsheets into dashboards.',
-    'FlowPilot costs 19 EUR per user per month; the Team plan costs 149 EUR per month for up to 10 users.',
-    'FlowPilot version 3.2 was released on 4 March 2026 and added dark mode and CSV export.',
-    'Support is available Monday to Friday, 9:00-17:00 CET, at support@zentrix.example.',
-    'Every Friday at 15:00 the team holds "Otter Hour", a demo session for new features.',
-    'Employees get 30 vacation days per year and can work remotely 3 days a week.',
-    'The internal Wi-Fi network is called ZTX-Guest and the password changes every Monday.',
-]
+DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs')
+INDEX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'faiss_index')  # Delete this folder to re-index docs/
 
-vector_store = InMemoryVectorStore(OpenAIEmbeddings(model='text-embedding-3-small'))
-vector_store.add_documents([Document(page_content=text) for text in KNOWLEDGE])
+embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
+
+if os.path.exists(INDEX_DIR):  # Load the saved index (no embedding calls)
+    vector_store = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)  # Safe: we created this file ourselves
+else:  # First run: read docs/, split into chunks, embed and save
+    documents = []
+    for name in sorted(os.listdir(DOCS_DIR)):
+        with open(os.path.join(DOCS_DIR, name), encoding='utf-8') as f:
+            documents.append(Document(page_content=f.read(), metadata={'source': name}))
+
+    chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_documents(documents)
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    vector_store.save_local(INDEX_DIR)
 
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'MEMORY.md')
 
