@@ -35,9 +35,29 @@ KNOWLEDGE = [
 vector_store = InMemoryVectorStore(OpenAIEmbeddings(model='text-embedding-3-small'))
 vector_store.add_documents([Document(page_content=text) for text in KNOWLEDGE])
 
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'MEMORY.md')
+
+
+def load_memory() -> str:
+    if not os.path.exists(MEMORY_FILE):
+        return ''
+    with open(MEMORY_FILE, encoding='utf-8') as f:
+        return f.read().strip()
+
+
+def with_memory(system_prompt: str) -> str:
+    memory = load_memory()
+    if not memory:
+        return system_prompt
+    return f'{system_prompt}\n\nLong-term memory (facts the user asked you to remember):\n{memory}'
+
 
 class IntentClassifier(BaseModel):
-    message_intent: Literal['chat', 'knowledge', 'code'] = Field(..., description='Classify whether the user wants to just chat, ask question or change code in the project.')
+    message_intent: Literal['chat', 'knowledge', 'code', 'memory'] = Field(..., description='Classify whether the user wants to just chat, ask question, change code in the project or have something remembered.')
+
+
+class MemoryFact(BaseModel):
+    fact: str = Field(..., description='The single fact to remember, as one short self-contained sentence.')
 
 
 class State(TypedDict): # Like 'MessagesState'
@@ -50,7 +70,7 @@ def classify_intent(state: State):
     structured_llm = llm.with_structured_output(IntentClassifier)
 
     result = structured_llm.invoke([
-        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge ("knowledge") or change code ("code").'},
+        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge ("knowledge"), change code ("code") or explicitly asks you to remember something ("memory").'},
         {'role': 'user', 'content': state['messages'][-1].content} # Last message from a user
     ])
 
@@ -71,7 +91,7 @@ def accept_coding(state: State):
 def prompt_llm_chat(state: State):
     print('Using chat')
     
-    messages = [{'role': 'system', 'content': 'You are a talkative chatbot for fun. Be nice.'}] + state['messages']
+    messages = [{'role': 'system', 'content': with_memory('You are a talkative chatbot for fun. Be nice.')}] + state['messages']
 
     response = llm.invoke(messages)
 
@@ -86,7 +106,7 @@ def prompt_llm_rag(state: State):
     context = '\n'.join(f'- {doc.page_content}' for doc in documents)
 
     messages = [
-        {'role': 'system', 'content': f'You are a RAG agent. Answer the user using only the context below. If the answer is not in it, say you don\'t know.\n\nContext:\n{context}'},
+        {'role': 'system', 'content': with_memory(f'You are a RAG agent. Answer the user using only the context below. If the answer is not in it, say you don\'t know.\n\nContext:\n{context}')},
     ] + state['messages']
 
     response = llm.invoke(messages)
@@ -112,11 +132,26 @@ def prompt_llm_code(state: State):
 
 def prepare_coding_request(state: State):
     messages = [
-        {'role': 'system', 'content': 'Rewrite the latest user coding request into a clear instruction for Claude Code. Use the conversation history as context. Only output the instruction, no explanation'}
+        {'role': 'system', 'content': with_memory('Rewrite the latest user coding request into a clear instruction for Claude Code. Use the conversation history as context. Only output the instruction, no explanation')}
     ] + state['messages']
 
     response = llm.invoke(messages)
     return {'coding_request': response.content}
+
+def save_memory(state: State):
+    print('Using memory')
+    structured_llm = llm.with_structured_output(MemoryFact)
+    result = structured_llm.invoke([
+        {'role': 'system', 'content': 'Extract the fact the user wants remembered. Output one short, self-contained sentence.'},
+        {'role': 'user', 'content': state['messages'][-1].content}
+    ])
+
+    fact = result.fact.strip()
+    with open(MEMORY_FILE, 'a', encoding='utf-8') as f:
+        f.write(f'- {fact}\n')
+
+    return {'messages': [{'role': 'assistant', 'content': f'Saved to memory: {fact}'}]}
+
 
 def prompt_llm(state: MessagesState):
     response = llm.invoke(state['messages'])
@@ -131,15 +166,17 @@ graph_builder.add_node('rag_agent', prompt_llm_rag)
 graph_builder.add_node('coding_agent', prompt_llm_code)
 graph_builder.add_node('prepare_coding_request', prepare_coding_request)
 graph_builder.add_node('accept_coding', accept_coding)
+graph_builder.add_node('save_memory', save_memory)
 
 graph_builder.add_edge(START, 'classifier')
 graph_builder.add_conditional_edges('accept_coding', lambda state: 'end' if state.get('next_node') == 'denied' else state['next_node'], {'end': END, 'coding_agent': 'coding_agent', 'accept_coding': 'prepare_coding_request'})
-graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'code': 'prepare_coding_request'})
+graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory'})
 graph_builder.add_edge('prepare_coding_request', 'accept_coding')
 
 graph_builder.add_edge('chat_agent', END)
 graph_builder.add_edge('rag_agent', END)
 graph_builder.add_edge('coding_agent', END)
+graph_builder.add_edge('save_memory', END)
 
 checkpointer = InMemorySaver()
 
