@@ -26,6 +26,9 @@ llm = init_chat_model('openai:gpt-4.1-mini')
 
 DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs')
 INDEX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'faiss_index')  # Delete this folder to re-index docs/
+WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspace')  # Where Claude Code works
+
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
 
@@ -158,10 +161,9 @@ def prompt_llm_web(state: State):
 def prompt_llm_code(state: State):
     print('Using code')
     user_prompt = state['coding_request']
-    workspace = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'workspace')
     result = subprocess.run(
         ['claude', '-p', user_prompt, '--permission-mode', 'acceptEdits'],
-        cwd=workspace,
+        cwd=WORKSPACE_DIR,
         capture_output=True,
         text=True
     )  
