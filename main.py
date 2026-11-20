@@ -1,9 +1,11 @@
 import os
 import uuid
+import time
 import subprocess
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Literal
 from pydantic import BaseModel, Field
+from ddgs import DDGS # For the web search
 
 from langchain.chat_models import init_chat_model
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -53,7 +55,11 @@ def with_memory(system_prompt: str) -> str:
 
 
 class IntentClassifier(BaseModel):
-    message_intent: Literal['chat', 'knowledge', 'code', 'memory'] = Field(..., description='Classify whether the user wants to just chat, ask question, change code in the project or have something remembered.')
+    message_intent: Literal['chat', 'knowledge', 'web', 'code', 'memory'] = Field(..., description='Classify whether the user wants to just chat, ask question, change code in the project or have something remembered.')
+
+
+class DocumentGrade(BaseModel):
+    relevant: bool = Field(..., description='True only if the documents answer the question.')
 
 
 class MemoryFact(BaseModel):
@@ -70,7 +76,7 @@ def classify_intent(state: State):
     structured_llm = llm.with_structured_output(IntentClassifier, method='function_calling')
 
     result = structured_llm.invoke([
-        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge ("knowledge"), change code ("code") or explicitly asks you to remember something ("memory").'},
+        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge about the company Zentrix Labs ("knowledge"), search the web for current or general information ("web"), change code ("code") or explicitly asks you to remember something ("memory").'},
         {'role': 'user', 'content': state['messages'][-1].content} # Last message from a user
     ])
 
@@ -105,8 +111,35 @@ def prompt_llm_rag(state: State):
 
     context = '\n'.join(f'- {doc.page_content}' for doc in documents)
 
+    grade = llm.with_structured_output(DocumentGrade, method='function_calling').invoke(
+        f'Question: {query}\n\nDocuments:\n{context}')
+    if not grade.relevant:
+        return {}  # Nothing added -> last message is still the user's -> fall back to web
+
     messages = [
         {'role': 'system', 'content': with_memory(f'You are a RAG agent. Answer the user using only the context below. If the answer is not in it, say you don\'t know.\n\nContext:\n{context}')},
+    ] + state['messages']
+
+    response = llm.invoke(messages)
+
+    return {'messages': [{'role': 'assistant', 'content': response.content}]}
+
+
+def prompt_llm_web(state: State):
+    print('Using web')
+    query = state['messages'][-1].content
+    results = []
+    for _ in range(3):  # Search engines often block / rate-limit scraping -> retry, then treat as no results
+        try:
+            results = DDGS().text(query, max_results=5)
+            break
+        except Exception:
+            time.sleep(2)  # Wait before retrying
+
+    context = '\n'.join(f'- {result["title"]}: {result["body"]}' for result in results)
+
+    messages = [
+        {'role': 'system', 'content': with_memory(f'Answer the user using only the web search results below. If the answer is not in them, say you don\'t know. Always start your answer with "(from web) ".\n\nSearch results:\n{context}')},
     ] + state['messages']
 
     response = llm.invoke(messages)
@@ -163,6 +196,7 @@ graph_builder = StateGraph(State)
 graph_builder.add_node('classifier', classify_intent)
 graph_builder.add_node('chat_agent', prompt_llm_chat)
 graph_builder.add_node('rag_agent', prompt_llm_rag)
+graph_builder.add_node('web_agent', prompt_llm_web)
 graph_builder.add_node('coding_agent', prompt_llm_code)
 graph_builder.add_node('prepare_coding_request', prepare_coding_request)
 graph_builder.add_node('accept_coding', accept_coding)
@@ -170,11 +204,12 @@ graph_builder.add_node('save_memory', save_memory)
 
 graph_builder.add_edge(START, 'classifier')
 graph_builder.add_conditional_edges('accept_coding', lambda state: 'end' if state.get('next_node') == 'denied' else state['next_node'], {'end': END, 'coding_agent': 'coding_agent', 'accept_coding': 'prepare_coding_request'})
-graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory'})
+graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'web': 'web_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory'})
 graph_builder.add_edge('prepare_coding_request', 'accept_coding')
 
 graph_builder.add_edge('chat_agent', END)
-graph_builder.add_edge('rag_agent', END)
+graph_builder.add_conditional_edges('rag_agent', lambda state: 'web_agent' if state['messages'][-1].type == 'human' else END, ['web_agent', END])
+graph_builder.add_edge('web_agent', END)
 graph_builder.add_edge('coding_agent', END)
 graph_builder.add_edge('save_memory', END)
 
@@ -186,7 +221,7 @@ graph.get_graph().draw_mermaid_png(output_file_path='graph.png')
 
 config = {'configurable': {'thread_id': uuid.uuid4()}}
 
-STREAMED_NODES = ('chat_agent', 'rag_agent')  # Nodes whose answers are printed token by token
+STREAMED_NODES = ('chat_agent', 'rag_agent', 'web_agent')  # Nodes whose answers are printed token by token
 
 while True:
     graph_input = {'messages': [{'role': 'user', 'content': input('Enter message: ')}]}
