@@ -67,7 +67,7 @@ class State(TypedDict): # Like 'MessagesState'
     coding_request: str | None  # Rewritten instruction for Claude Code (kept out of messages)
 
 def classify_intent(state: State):
-    structured_llm = llm.with_structured_output(IntentClassifier)
+    structured_llm = llm.with_structured_output(IntentClassifier, method='function_calling')
 
     result = structured_llm.invoke([
         {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge ("knowledge"), change code ("code") or explicitly asks you to remember something ("memory").'},
@@ -140,7 +140,7 @@ def prepare_coding_request(state: State):
 
 def save_memory(state: State):
     print('Using memory')
-    structured_llm = llm.with_structured_output(MemoryFact)
+    structured_llm = llm.with_structured_output(MemoryFact, method='function_calling')
     result = structured_llm.invoke([
         {'role': 'system', 'content': 'Extract the fact the user wants remembered. Output one short, self-contained sentence.'},
         {'role': 'user', 'content': state['messages'][-1].content}
@@ -186,12 +186,24 @@ graph.get_graph().draw_mermaid_png(output_file_path='graph.png')
 
 config = {'configurable': {'thread_id': uuid.uuid4()}}
 
-while True:
-    user_message = input('Enter message: ')
-    result = graph.invoke({'messages': [{'role': 'user', 'content': user_message}]}, config=config)
+STREAMED_NODES = ('chat_agent', 'rag_agent')  # Nodes whose answers are printed token by token
 
-    while '__interrupt__' in result: # Handle coding agent (accept/deny)
-        prompt = result['__interrupt__'][0].value
-        decision = input(f'{prompt}\n> ')
-        result = graph.invoke(Command(resume=decision), config=config)
-    print(result['messages'][-1].content)
+while True:
+    graph_input = {'messages': [{'role': 'user', 'content': input('Enter message: ')}]}
+    streamed = False
+
+    while graph_input:
+        for token, metadata in graph.stream(graph_input, config=config, stream_mode='messages'):
+            if metadata['langgraph_node'] in STREAMED_NODES:
+                print(token.content, end='', flush=True)
+                streamed = True
+
+        state = graph.get_state(config)
+        graph_input = None
+        if state.interrupts:  # Coding agent asks for approval
+            graph_input = Command(resume=input(f'{state.interrupts[0].value}\n> '))
+
+    if streamed:
+        print()  # End the streamed line
+    else:
+        print(state.values['messages'][-1].content)  # Coding, memory or denial reply
