@@ -55,11 +55,15 @@ def with_memory(system_prompt: str) -> str:
 
 
 class IntentClassifier(BaseModel):
-    message_intent: Literal['chat', 'knowledge', 'web', 'code', 'memory'] = Field(..., description='Classify whether the user wants to just chat, ask question, change code in the project or have something remembered.')
+    message_intent: Literal['chat', 'knowledge', 'web', 'code', 'memory', 'forget'] = Field(..., description='Classify whether the user wants to just chat, ask question, change code in the project, have something remembered or have something forgotten.')
 
 
 class DocumentGrade(BaseModel):
     relevant: bool = Field(..., description='True only if the documents answer the question.')
+
+
+class ForgetFacts(BaseModel):
+    line_numbers: list[int] = Field(..., description='Numbers of the memory lines to delete. Empty if nothing matches.')
 
 
 class MemoryFact(BaseModel):
@@ -76,7 +80,7 @@ def classify_intent(state: State):
     structured_llm = llm.with_structured_output(IntentClassifier, method='function_calling')
 
     result = structured_llm.invoke([
-        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge about the company Zentrix Labs ("knowledge"), search the web for current or general information ("web"), change code ("code") or explicitly asks you to remember something ("memory").'},
+        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge about the company Zentrix Labs ("knowledge"), search the web for current or general information ("web"), change code ("code") explicitly asks you to remember something ("memory") or asks you to forget something ("forget").'},
         {'role': 'user', 'content': state['messages'][-1].content} # Last message from a user
     ])
 
@@ -191,6 +195,27 @@ def prompt_llm(state: MessagesState):
     return {'messages': [response]}
 
 
+def forget_memory(state: State):
+    print('Using forget')
+    lines = load_memory().splitlines()
+    numbered = '\n'.join(f'{number}. {line}' for number, line in enumerate(lines, 1))
+
+    structured_llm = llm.with_structured_output(ForgetFacts, method='function_calling')
+    result = structured_llm.invoke([
+        {'role': 'system', 'content': 'The user wants you to forget something. Return the numbers of the memory lines that match the request.'},
+        {'role': 'user', 'content': f'Request: {state["messages"][-1].content}\n\nMemory:\n{numbered}'}
+    ])
+
+    forgotten = [line for number, line in enumerate(lines, 1) if number in result.line_numbers]
+    if not forgotten:
+        return {'messages': [{'role': 'assistant', 'content': 'Nothing in memory matches that.'}]}
+
+    with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+        f.writelines(f'{line}\n' for line in lines if line not in forgotten)
+
+    return {'messages': [{'role': 'assistant', 'content': 'Forgot:\n' + '\n'.join(forgotten)}]}
+
+
 graph_builder = StateGraph(State)
 
 graph_builder.add_node('classifier', classify_intent)
@@ -201,10 +226,11 @@ graph_builder.add_node('coding_agent', prompt_llm_code)
 graph_builder.add_node('prepare_coding_request', prepare_coding_request)
 graph_builder.add_node('accept_coding', accept_coding)
 graph_builder.add_node('save_memory', save_memory)
+graph_builder.add_node('forget_memory', forget_memory)
 
 graph_builder.add_edge(START, 'classifier')
 graph_builder.add_conditional_edges('accept_coding', lambda state: 'end' if state.get('next_node') == 'denied' else state['next_node'], {'end': END, 'coding_agent': 'coding_agent', 'accept_coding': 'prepare_coding_request'})
-graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'web': 'web_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory'})
+graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'web': 'web_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory', 'forget': 'forget_memory'})
 graph_builder.add_edge('prepare_coding_request', 'accept_coding')
 
 graph_builder.add_edge('chat_agent', END)
@@ -212,6 +238,7 @@ graph_builder.add_conditional_edges('rag_agent', lambda state: 'web_agent' if st
 graph_builder.add_edge('web_agent', END)
 graph_builder.add_edge('coding_agent', END)
 graph_builder.add_edge('save_memory', END)
+graph_builder.add_edge('forget_memory', END)
 
 checkpointer = InMemorySaver()
 
@@ -223,8 +250,10 @@ config = {'configurable': {'thread_id': uuid.uuid4()}}
 
 STREAMED_NODES = ('chat_agent', 'rag_agent', 'web_agent')  # Nodes whose answers are printed token by token
 
+round_ = 1
 while True:
-    graph_input = {'messages': [{'role': 'user', 'content': input('Enter message: ')}]}
+    user_input = input(f'{round_} - Enter message: ')
+    graph_input = {'messages': [{'role': 'user', 'content': user_input}]}
     streamed = False
 
     while graph_input:
@@ -242,3 +271,5 @@ while True:
         print()  # End the streamed line
     else:
         print(state.values['messages'][-1].content)  # Coding, memory or denial reply
+    print('\n')
+    round_ += 1
