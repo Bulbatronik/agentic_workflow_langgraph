@@ -1,4 +1,5 @@
 .env
 *.png
+*.pyc
 MEMORY.md
 faiss_index/

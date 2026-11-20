@@ -10,7 +10,7 @@ def classify_intent(state: State):
     structured_llm = llm.with_structured_output(IntentClassifier, method='function_calling')
 
     result = structured_llm.invoke([
-        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge about the company Zentrix Labs ("knowledge"), search the web for current or general information ("web"), change code ("code") explicitly asks you to remember something ("memory") or asks you to forget something ("forget").'},
+        {'role': 'system', 'content': 'Determine / classify if the user wants to chat ("chat"), retrieve knowledge about the company Zentrix Labs ("knowledge"), search the web for current or general information ("web"), change code ("code"), asks you to store new information ("memory", e.g. "remember that ...") or asks you to forget something ("forget"). Questions about the user or about what you remember are "chat".'},
         {'role': 'user', 'content': state['messages'][-1].content} # Last message from a user
     ])
 
@@ -108,7 +108,7 @@ def save_memory(state: State):
     print('Using memory')
     structured_llm = llm.with_structured_output(MemoryFact, method='function_calling')
     result = structured_llm.invoke([
-        {'role': 'system', 'content': 'Extract the fact the user wants remembered. Output one short, self-contained sentence.'},
+        {'role': 'system', 'content': 'Extract the fact the user wants remembered. Output one short, self-contained sentence. If the message contains no concrete fact to remember, return no fact.'},
         {'role': 'user', 'content': state['messages'][-1].content}
     ])
 
