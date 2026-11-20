@@ -67,7 +67,7 @@ class ForgetFacts(BaseModel):
 
 
 class MemoryFact(BaseModel):
-    fact: str = Field(..., description='The single fact to remember, as one short self-contained sentence.')
+    fact: str | None = Field(None, description='The fact to remember, as one short self-contained sentence. None if there is nothing worth remembering.')
 
 
 class State(TypedDict): # Like 'MessagesState'
@@ -183,6 +183,9 @@ def save_memory(state: State):
         {'role': 'user', 'content': state['messages'][-1].content}
     ])
 
+    if not result.fact:
+        return {'messages': [{'role': 'assistant', 'content': 'I found nothing to remember in that.'}]}
+
     fact = result.fact.strip()
     with open(MEMORY_FILE, 'a', encoding='utf-8') as f:
         f.write(f'- {fact}\n')
@@ -193,6 +196,21 @@ def save_memory(state: State):
 def prompt_llm(state: MessagesState):
     response = llm.invoke(state['messages'])
     return {'messages': [response]}
+
+
+def auto_memory(state: State):
+    structured_llm = llm.with_structured_output(MemoryFact, method='function_calling')
+    result = structured_llm.invoke([
+        {'role': 'system', 'content': f'Decide if the user message contains a lasting fact or preference about the user worth remembering for future conversations (e.g. name, job, preferences, projects). Ignore small talk, questions and temporary details. Do not repeat facts already in memory.\n\nMemory:\n{load_memory()}'},
+        {'role': 'user', 'content': state['messages'][-2].content}  # The user's message (-1 is the chat answer)
+    ])
+
+    if result.fact:
+        with open(MEMORY_FILE, 'a', encoding='utf-8') as f:
+            f.write(f'- {result.fact.strip()}\n')
+        print(f'\n[Remembered: {result.fact.strip()}]', end='')
+
+    return {}
 
 
 def forget_memory(state: State):
@@ -227,13 +245,15 @@ graph_builder.add_node('prepare_coding_request', prepare_coding_request)
 graph_builder.add_node('accept_coding', accept_coding)
 graph_builder.add_node('save_memory', save_memory)
 graph_builder.add_node('forget_memory', forget_memory)
+graph_builder.add_node('auto_memory', auto_memory)
 
 graph_builder.add_edge(START, 'classifier')
 graph_builder.add_conditional_edges('accept_coding', lambda state: 'end' if state.get('next_node') == 'denied' else state['next_node'], {'end': END, 'coding_agent': 'coding_agent', 'accept_coding': 'prepare_coding_request'})
 graph_builder.add_conditional_edges('classifier', lambda state: state['message_intent'], {'chat': 'chat_agent', 'knowledge': 'rag_agent', 'web': 'web_agent', 'code': 'prepare_coding_request', 'memory': 'save_memory', 'forget': 'forget_memory'})
 graph_builder.add_edge('prepare_coding_request', 'accept_coding')
 
-graph_builder.add_edge('chat_agent', END)
+graph_builder.add_edge('chat_agent', 'auto_memory')
+graph_builder.add_edge('auto_memory', END)
 graph_builder.add_conditional_edges('rag_agent', lambda state: 'web_agent' if state['messages'][-1].type == 'human' else END, ['web_agent', END])
 graph_builder.add_edge('web_agent', END)
 graph_builder.add_edge('coding_agent', END)
